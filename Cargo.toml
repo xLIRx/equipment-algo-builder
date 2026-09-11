@@ -1,0 +1,15 @@
+[package]
+name = "equipment_algo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+# Добавляем загрузчик картинок
+egui_extras = { version = "0.27", features = ["all_loaders"] }
+# Добавляем нативные диалоговые окна (для выбора файлов)
+rfd = "0.14"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
