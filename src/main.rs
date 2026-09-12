@@ -1,9 +1,50 @@
+mod i18n;
+
 use chrono::{DateTime, Utc};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
+use i18n::Language;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 use uuid::Uuid;
 
-// --- СТРУКТУРЫ ДАННЫХ ---
+const SETTINGS_FILE: &str = "settings.json";
+const ARCHIVE_DIR: &str = "archive";
+
+// --- НАСТРОЙКИ ПРИЛОЖЕНИЯ ---
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AppSettings {
+    pub language: Language,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            language: Language::Ru,
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn load() -> Self {
+        if let Ok(data) = fs::read_to_string(SETTINGS_FILE) {
+            if let Ok(settings) = serde_json::from_str(&data) {
+                return settings;
+            }
+        }
+        Self::default()
+    }
+
+    pub fn save(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = fs::write(SETTINGS_FILE, json);
+        }
+    }
+}
+
+// --- СТРУКТУРЫ ДАННЫХ АЛГОРИТМА ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EquipmentInfo {
@@ -21,7 +62,7 @@ impl Default for EquipmentInfo {
         Self {
             eq_type: String::new(),
             model: String::new(),
-            name: String::new(),
+            name: "Новое оборудование".to_string(),
             inv_number: String::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -79,6 +120,7 @@ impl Step {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Algorithm {
+    pub id: Uuid,
     pub metadata: EquipmentInfo,
     pub steps: Vec<Step>,
     pub first_step_id: Option<Uuid>,
@@ -87,6 +129,7 @@ pub struct Algorithm {
 impl Default for Algorithm {
     fn default() -> Self {
         Self {
+            id: Uuid::new_v4(),
             metadata: EquipmentInfo::default(),
             steps: Vec::new(),
             first_step_id: None,
@@ -104,10 +147,90 @@ struct RunnerState {
     safety_acknowledged: bool,
 }
 
+// --- УПРАВЛЕНИЕ АРХИВОМ ---
+
+fn save_algorithm_to_archive(algo: &mut Algorithm) -> Result<(), String> {
+    let project_dir = PathBuf::from(ARCHIVE_DIR).join(algo.id.to_string());
+    let images_dir = project_dir.join("images");
+
+    fs::create_dir_all(&images_dir).map_err(|e| e.to_string())?;
+
+    for step in &mut algo.steps {
+        if let Some(src_str) = &step.image_path {
+            let src_path = PathBuf::from(src_str);
+            if src_path.exists() {
+                let inside_proj = src_path.starts_with(&images_dir);
+                if !inside_proj {
+                    let file_name = src_path.file_name().unwrap_or_default().to_string_lossy();
+                    let target_name = format!("{}_{}", step.id, file_name);
+                    let target_path = images_dir.join(target_name);
+
+                    if fs::copy(&src_path, &target_path).is_ok() {
+                        step.image_path = Some(target_path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    algo.metadata.updated_at = Utc::now();
+
+    let json = serde_json::to_string_pretty(&algo).map_err(|e| e.to_string())?;
+    let data_file = project_dir.join("data.json");
+    fs::write(data_file, json).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn load_all_from_archive() -> Vec<Algorithm> {
+    let mut list = Vec::new();
+    let archive_path = Path::new(ARCHIVE_DIR);
+    if !archive_path.exists() {
+        return list;
+    }
+
+    if let Ok(entries) = fs::read_dir(archive_path) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let data_file = entry.path().join("data.json");
+                if data_file.exists() {
+                    if let Ok(content) = fs::read_to_string(data_file) {
+                        if let Ok(algo) = serde_json::from_str::<Algorithm>(&content) {
+                            list.push(algo);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    list.sort_by(|a, b| b.metadata.updated_at.cmp(&a.metadata.updated_at));
+    list
+}
+
+fn delete_from_archive(id: Uuid) {
+    let project_dir = PathBuf::from(ARCHIVE_DIR).join(id.to_string());
+    if project_dir.exists() {
+        let _ = fs::remove_dir_all(project_dir);
+    }
+}
+
+// Преобразование пути в URI для egui
+fn to_image_uri(path_str: &str) -> String {
+    if let Ok(abs) = fs::canonicalize(path_str) {
+        let clean = abs.to_string_lossy().replace('\\', "/");
+        let formatted = clean.trim_start_matches("//?/").trim_start_matches("/?");
+        format!("file://{}", formatted)
+    } else {
+        format!("file://{}", path_str.replace('\\', "/"))
+    }
+}
+
 // --- СОСТОЯНИЕ GUI ---
 
 struct AlgoApp {
     current_tab: String,
+    settings: AppSettings,
     active_algo: Algorithm,
     selected_step_id: Option<Uuid>,
     canvas_pan: Vec2,
@@ -116,6 +239,12 @@ struct AlgoApp {
     drag_start_mouse: Pos2,
     drag_start_node_pos: [f32; 2],
     runner: RunnerState,
+    // Состояние архива и интерфейса
+    show_passport_modal: bool,
+    status_msg: Option<(String, Instant)>,
+    archive_list: Vec<Algorithm>,
+    archive_search: String,
+    archive_loaded: bool,
 }
 
 impl AlgoApp {
@@ -123,6 +252,7 @@ impl AlgoApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         Self {
             current_tab: "Конструктор".to_owned(),
+            settings: AppSettings::load(),
             active_algo: Algorithm::default(),
             selected_step_id: None,
             canvas_pan: Vec2::new(120.0, 100.0),
@@ -131,7 +261,21 @@ impl AlgoApp {
             drag_start_mouse: Pos2::ZERO,
             drag_start_node_pos: [0.0, 0.0],
             runner: RunnerState::default(),
+            show_passport_modal: false,
+            status_msg: None,
+            archive_list: Vec::new(),
+            archive_search: String::new(),
+            archive_loaded: false,
         }
+    }
+
+    fn refresh_archive(&mut self) {
+        self.archive_list = load_all_from_archive();
+        self.archive_loaded = true;
+    }
+
+    fn set_status(&mut self, text: String) {
+        self.status_msg = Some((text, Instant::now()));
     }
 
     fn reset_runner(&mut self) {
@@ -201,21 +345,83 @@ impl AlgoApp {
 
 impl eframe::App for AlgoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let lang = self.settings.language;
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
-                ui.selectable_value(&mut self.current_tab, "Конструктор".to_string(), "🕸 Схема алгоритма");
-                if ui.selectable_value(&mut self.current_tab, "Диагностика".to_string(), "▶ Тест алгоритма").clicked() {
+                ui.selectable_value(&mut self.current_tab, "Конструктор".to_string(), lang.tab_builder());
+                if ui.selectable_value(&mut self.current_tab, "Диагностика".to_string(), lang.tab_runner()).clicked() {
                     self.reset_runner();
                 }
-                ui.selectable_value(&mut self.current_tab, "Архив".to_string(), "📚 Архив");
+                if ui.selectable_value(&mut self.current_tab, "Архив".to_string(), lang.tab_archive()).clicked() {
+                    self.refresh_archive();
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut current_lang = self.settings.language;
+                    let label = match current_lang {
+                        Language::Ru => "🇷🇺 RU",
+                        Language::En => "🇬🇧 EN",
+                    };
+
+                    egui::ComboBox::from_id_source("lang_selector")
+                        .selected_text(label)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_value(&mut current_lang, Language::Ru, "🇷🇺 Русский").clicked()
+                                || ui.selectable_value(&mut current_lang, Language::En, "🇬🇧 English").clicked()
+                            {
+                                self.settings.language = current_lang;
+                                self.settings.save();
+                            }
+                        });
+                });
             });
         });
+
+        // Модальное окно паспорта оборудования
+        if self.show_passport_modal {
+            egui::Window::new(lang.passport_window_title())
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    egui::Grid::new("passport_fields").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                        ui.label(lang.field_name());
+                        ui.text_edit_singleline(&mut self.active_algo.metadata.name);
+                        ui.end_row();
+
+                        ui.label(lang.field_type());
+                        ui.text_edit_singleline(&mut self.active_algo.metadata.eq_type);
+                        ui.end_row();
+
+                        ui.label(lang.field_model());
+                        ui.text_edit_singleline(&mut self.active_algo.metadata.model);
+                        ui.end_row();
+
+                        ui.label(lang.field_inv());
+                        ui.text_edit_singleline(&mut self.active_algo.metadata.inv_number);
+                        ui.end_row();
+
+                        ui.label(lang.field_author());
+                        ui.text_edit_singleline(&mut self.active_algo.metadata.author);
+                        ui.end_row();
+                    });
+
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(lang.btn_close()).clicked() {
+                            self.show_passport_modal = false;
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.current_tab.as_str() {
                 "Конструктор" => self.render_builder_mode(ui),
                 "Диагностика" => self.render_runner_mode(ui),
-                "Архив" => self.render_archive(ui),
+                "Архив" => self.render_archive_mode(ui),
                 _ => {}
             }
         });
@@ -225,15 +431,40 @@ impl eframe::App for AlgoApp {
 impl AlgoApp {
     fn render_builder_mode(&mut self, ui: &mut egui::Ui) {
         let view_size = ui.available_size_before_wrap();
+        let lang = self.settings.language;
 
         ui.horizontal(|ui| {
-            if ui.button("➕ Добавить блок").clicked() {
+            if ui.button(lang.btn_new()).clicked() {
+                self.active_algo = Algorithm::default();
+                self.selected_step_id = None;
+                self.canvas_pan = Vec2::new(120.0, 100.0);
+                self.canvas_zoom = 1.0;
+            }
+
+            if ui.button(lang.btn_save()).clicked() {
+                if save_algorithm_to_archive(&mut self.active_algo).is_ok() {
+                    self.set_status(lang.save_success().to_string());
+                    self.refresh_archive();
+                }
+            }
+
+            if ui.button(lang.btn_passport()).clicked() {
+                self.show_passport_modal = true;
+            }
+
+            ui.separator();
+
+            if ui.button(lang.add_block()).clicked() {
                 let count = self.active_algo.steps.len() + 1;
                 let new_pos = [
                     (-self.canvas_pan.x + 220.0 + (count as f32 * 30.0)) / self.canvas_zoom,
                     (-self.canvas_pan.y + 120.0 + (count as f32 * 30.0)) / self.canvas_zoom,
                 ];
-                let step = Step::new(format!("Шаг {}", count), new_pos);
+                let title = match lang {
+                    Language::Ru => format!("Шаг {}", count),
+                    Language::En => format!("Step {}", count),
+                };
+                let step = Step::new(title, new_pos);
                 let id = step.id;
                 if self.active_algo.first_step_id.is_none() {
                     self.active_algo.first_step_id = Some(id);
@@ -242,19 +473,27 @@ impl AlgoApp {
                 self.selected_step_id = Some(id);
             }
 
-            ui.separator();
-            if ui.button("🔍 Вписать всё").clicked() {
+            if ui.button(lang.fit_view()).clicked() {
                 self.fit_to_view(view_size);
             }
 
             ui.separator();
-            ui.label(format!("Масштаб: {:.0}%", self.canvas_zoom * 100.0));
+            ui.label(format!("{} {:.0}%", lang.zoom_label(), self.canvas_zoom * 100.0));
             if ui.button("100%").clicked() {
                 self.canvas_zoom = 1.0_f32;
             }
 
-            ui.separator();
-            ui.label("🖱 Зажать ЛКМ: перемещение | ПКМ: панорама | Колесико: масштаб");
+            // Статус сохранения
+            if let Some((msg, time)) = &self.status_msg {
+                if time.elapsed().as_secs() < 3 {
+                    ui.separator();
+                    ui.colored_label(Color32::from_rgb(90, 220, 120), msg);
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(lang.toolbar_hint());
+            });
         });
         ui.separator();
 
@@ -278,24 +517,25 @@ impl AlgoApp {
 
     fn render_runner_mode(&mut self, ui: &mut egui::Ui) {
         let view_size = ui.available_size_before_wrap();
+        let lang = self.settings.language;
 
         ui.horizontal(|ui| {
-            if !self.runner.history.is_empty() && ui.button("⬅ Шаг назад").clicked() {
+            if !self.runner.history.is_empty() && ui.button(lang.step_back()).clicked() {
                 self.navigate_runner_back();
             }
-            if ui.button("🔄 Сброс теста").clicked() {
+            if ui.button(lang.reset_test()).clicked() {
                 self.reset_runner();
             }
             if let Some(curr_id) = self.runner.current_step_id {
-                if ui.button("🎯 Фокус на шаге").clicked() {
+                if ui.button(lang.focus_step()).clicked() {
                     self.focus_step_on_canvas(curr_id, view_size);
                 }
             }
-            if ui.button("🔍 Вписать всё").clicked() {
+            if ui.button(lang.fit_view()).clicked() {
                 self.fit_to_view(view_size);
             }
             ui.separator();
-            ui.label(format!("Масштаб: {:.0}%", self.canvas_zoom * 100.0));
+            ui.label(format!("{} {:.0}%", lang.zoom_label(), self.canvas_zoom * 100.0));
         });
         ui.separator();
 
@@ -310,14 +550,138 @@ impl AlgoApp {
         self.render_canvas(ui, true);
     }
 
+    fn render_archive_mode(&mut self, ui: &mut egui::Ui) {
+        let lang = self.settings.language;
+
+        if !self.archive_loaded {
+            self.refresh_archive();
+        }
+
+        ui.horizontal(|ui| {
+            ui.heading(lang.tab_archive());
+            ui.separator();
+            ui.add(egui::TextEdit::singleline(&mut self.archive_search).hint_text(lang.search_placeholder()));
+            if ui.button(lang.btn_refresh()).clicked() {
+                self.refresh_archive();
+            }
+        });
+        ui.separator();
+
+        let query = self.archive_search.trim().to_lowercase();
+        let filtered: Vec<&Algorithm> = self.archive_list
+            .iter()
+            .filter(|a| {
+                if query.is_empty() {
+                    return true;
+                }
+                a.metadata.name.to_lowercase().contains(&query)
+                    || a.metadata.model.to_lowercase().contains(&query)
+                    || a.metadata.eq_type.to_lowercase().contains(&query)
+                    || a.metadata.inv_number.to_lowercase().contains(&query)
+                    || a.metadata.author.to_lowercase().contains(&query)
+            })
+            .collect();
+
+        if self.archive_list.is_empty() {
+            ui.label(lang.empty_archive());
+            return;
+        }
+
+        if filtered.is_empty() {
+            ui.label(lang.not_found());
+            return;
+        }
+
+        let mut id_to_load_builder: Option<Algorithm> = None;
+        let mut id_to_load_runner: Option<Algorithm> = None;
+        let mut id_to_delete: Option<Uuid> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for algo in filtered {
+                egui::Frame::group(ui.style())
+                    .fill(Color32::from_rgb(26, 30, 38))
+                    .rounding(6.0)
+                    .inner_margin(12.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                let display_name = if algo.metadata.name.is_empty() {
+                                    "Без названия".to_string()
+                                } else {
+                                    algo.metadata.name.clone()
+                                };
+                                ui.heading(display_name);
+
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    if !algo.metadata.eq_type.is_empty() {
+                                        ui.colored_label(Color32::from_rgb(120, 170, 255), &algo.metadata.eq_type);
+                                        ui.label("|");
+                                    }
+                                    if !algo.metadata.model.is_empty() {
+                                        ui.label(format!("Модель: {}", algo.metadata.model));
+                                        ui.label("|");
+                                    }
+                                    if !algo.metadata.inv_number.is_empty() {
+                                        ui.label(format!("Инв. №: {}", algo.metadata.inv_number));
+                                        ui.label("|");
+                                    }
+                                    ui.colored_label(Color32::from_rgb(180, 190, 200), format!("{} {}", algo.steps.len(), lang.card_steps()));
+                                });
+
+                                ui.add_space(2.0);
+                                ui.horizontal(|ui| {
+                                    if !algo.metadata.author.is_empty() {
+                                        ui.label(format!("Автор: {}", algo.metadata.author));
+                                        ui.label("|");
+                                    }
+                                    ui.label(format!("{} {}", lang.card_updated(), algo.metadata.updated_at.format("%d.%m.%Y %H:%M")));
+                                });
+                            });
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(lang.btn_delete_archive()).clicked() {
+                                    id_to_delete = Some(algo.id);
+                                }
+                                if ui.button(lang.btn_run_diag()).clicked() {
+                                    id_to_load_runner = Some(algo.clone());
+                                }
+                                if ui.button(lang.btn_open_builder()).clicked() {
+                                    id_to_load_builder = Some(algo.clone());
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+        });
+
+        if let Some(algo) = id_to_load_builder {
+            self.active_algo = algo;
+            self.selected_step_id = self.active_algo.first_step_id;
+            self.current_tab = "Конструктор".to_string();
+        }
+
+        if let Some(algo) = id_to_load_runner {
+            self.active_algo = algo;
+            self.reset_runner();
+            self.current_tab = "Диагностика".to_string();
+        }
+
+        if let Some(del_id) = id_to_delete {
+            delete_from_archive(del_id);
+            self.refresh_archive();
+        }
+    }
+
     fn render_canvas(&mut self, ui: &mut egui::Ui, is_test_mode: bool) {
         let (response, painter) = ui.allocate_painter(ui.available_size_before_wrap(), egui::Sense::hover());
         let canvas_rect = response.rect;
+        let lang = self.settings.language;
 
         let pointer = ui.input(|i| i.pointer.clone());
         let is_in_canvas = pointer.hover_pos().map_or(false, |p| canvas_rect.contains(p));
 
-        // Масштабирование колесиком мыши к курсору
         let scroll_delta_y = ui.input(|i| i.raw_scroll_delta.y);
         if is_in_canvas && scroll_delta_y.abs() > 0.1 {
             let zoom_factor = if scroll_delta_y > 0.0 { 1.10_f32 } else { 0.90_f32 };
@@ -331,7 +695,6 @@ impl AlgoApp {
             ui.ctx().request_repaint();
         }
 
-        // Панорамирование холста правой кнопкой мыши
         if pointer.secondary_down() && is_in_canvas {
             let delta = pointer.delta();
             if delta.length_sq() > 0.0 {
@@ -343,7 +706,6 @@ impl AlgoApp {
 
         let node_size = Vec2::new(200.0, 95.0) * self.canvas_zoom;
 
-        // Полностью свободное перетаскивание узлов без округлений
         if !is_test_mode {
             if pointer.primary_pressed() && is_in_canvas {
                 if let Some(pos) = pointer.latest_pos() {
@@ -381,7 +743,6 @@ impl AlgoApp {
             }
         }
 
-        // Фоновая координатная сетка
         let grid_size = 40.0 * self.canvas_zoom;
         let stroke_grid = Stroke::new(1.0_f32, Color32::from_rgb(30, 34, 42));
 
@@ -399,7 +760,6 @@ impl AlgoApp {
             painter.line_segment([Pos2::new(canvas_rect.min.x, y), Pos2::new(canvas_rect.max.x, y)], stroke_grid);
         }
 
-        // Экранные координаты карточек
         let mut node_rects: Vec<(Uuid, Rect)> = Vec::new();
         for step in &self.active_algo.steps {
             let screen_pos = Pos2::new(
@@ -417,10 +777,13 @@ impl AlgoApp {
             }
         }
 
-        // Отрисовка стрелок связей и разрыв кликом по бейджу
         let mouse_clicked = pointer.primary_clicked() && is_in_canvas;
         let click_pos = pointer.latest_pos();
         let mut link_to_disconnect: Option<(Uuid, usize, u8)> = None;
+
+        let norm_text = match lang { Language::Ru => "Норма", Language::En => "Normal" };
+        let abn_text = match lang { Language::Ru => "Отклонение", Language::En => "Abnormal" };
+        let safe_text = match lang { Language::Ru => "Ознакомлен", Language::En => "Acknowledged" };
 
         for step in &self.active_algo.steps {
             let from_rect = match node_rects.iter().find(|(id, _)| *id == step.id) {
@@ -440,15 +803,15 @@ impl AlgoApp {
                 }
                 StepKind::Measurement { next_if_normal, next_if_abnormal, .. } => {
                     if let Some(nid) = next_if_normal {
-                        connections.push((*nid, "Норма".to_string(), Color32::from_rgb(80, 220, 120), 0, 1));
+                        connections.push((*nid, norm_text.to_string(), Color32::from_rgb(80, 220, 120), 0, 1));
                     }
                     if let Some(aid) = next_if_abnormal {
-                        connections.push((*aid, "Отклонение".to_string(), Color32::from_rgb(255, 90, 90), 0, 2));
+                        connections.push((*aid, abn_text.to_string(), Color32::from_rgb(255, 90, 90), 0, 2));
                     }
                 }
                 StepKind::SafetyWarning { next_step_id, .. } => {
                     if let Some(nid) = next_step_id {
-                        connections.push((*nid, "Ознакомлен".to_string(), Color32::from_rgb(255, 190, 40), 0, 3));
+                        connections.push((*nid, safe_text.to_string(), Color32::from_rgb(255, 190, 40), 0, 3));
                     }
                 }
             }
@@ -510,7 +873,6 @@ impl AlgoApp {
             }
         }
 
-        // Отрисовка карточек шагов
         for (id, rect) in &node_rects {
             let step = match self.active_algo.steps.iter().find(|s| s.id == *id) {
                 Some(s) => s,
@@ -559,29 +921,18 @@ impl AlgoApp {
             painter.rect_filled(*rect, 6.0 * self.canvas_zoom, bg_color);
             painter.rect_stroke(*rect, 6.0 * self.canvas_zoom, border_stroke);
 
-            let port_radius = 4.0 * self.canvas_zoom;
-            let port_in = Pos2::new(rect.center().x, rect.min.y);
-            let port_out = Pos2::new(rect.center().x, rect.max.y);
-            let port_fill = Color32::from_rgb(40, 45, 55);
-            let port_stroke = Stroke::new(1.2 * self.canvas_zoom, Color32::from_rgb(100, 120, 150));
-
-            painter.circle_filled(port_in, port_radius, port_fill);
-            painter.circle_stroke(port_in, port_radius, port_stroke);
-            painter.circle_filled(port_out, port_radius, port_fill);
-            painter.circle_stroke(port_out, port_radius, port_stroke);
-
             let header_height = 26.0 * self.canvas_zoom;
             let header_rect = Rect::from_min_size(rect.min, Vec2::new(rect.width(), header_height));
 
             let (header_bg, badge_text) = if is_current_run {
-                (Color32::from_rgb(110, 80, 15), "АКТИВЕН ▶")
+                (Color32::from_rgb(110, 80, 15), lang.badge_active())
             } else if is_passed_run {
-                (Color32::from_rgb(25, 70, 40), "ВЫПОЛНЕНО ✔")
+                (Color32::from_rgb(25, 70, 40), lang.badge_done())
             } else {
                 match &step.kind {
-                    StepKind::Standard => (Color32::from_rgb(45, 65, 95), "Выбор"),
-                    StepKind::Measurement { .. } => (Color32::from_rgb(70, 45, 95), "Замер"),
-                    StepKind::SafetyWarning { .. } => (Color32::from_rgb(95, 60, 25), "ТБ ⚠"),
+                    StepKind::Standard => (Color32::from_rgb(45, 65, 95), lang.badge_choice()),
+                    StepKind::Measurement { .. } => (Color32::from_rgb(70, 45, 95), lang.badge_measure()),
+                    StepKind::SafetyWarning { .. } => (Color32::from_rgb(95, 60, 25), lang.badge_safety()),
                 }
             };
 
@@ -608,7 +959,7 @@ impl AlgoApp {
 
             let desc_font_size = (12.0 * self.canvas_zoom).clamp(7.5, 20.0);
             let preview_text = if step.description.trim().is_empty() {
-                "Описание отсутствует".to_string()
+                lang.no_desc().to_string()
             } else {
                 let line = step.description.lines().next().unwrap_or("");
                 if line.chars().count() > 22 {
@@ -630,7 +981,7 @@ impl AlgoApp {
                 painter.text(
                     rect.min + Vec2::new(10.0 * self.canvas_zoom, 68.0 * self.canvas_zoom),
                     egui::Align2::LEFT_TOP,
-                    "🖼 фото прикреплено",
+                    lang.photo_attached(),
                     egui::FontId::proportional((11.0 * self.canvas_zoom).clamp(7.0, 17.0)),
                     Color32::from_rgb(100, 180, 255),
                 );
@@ -664,7 +1015,8 @@ impl AlgoApp {
     }
 
     fn render_runner_controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Пульт диагностики");
+        let lang = self.settings.language;
+        ui.heading(lang.runner_heading());
         ui.label(format!(
             "{} ({}) | №: {}",
             self.active_algo.metadata.name,
@@ -676,9 +1028,9 @@ impl AlgoApp {
         let current_id = match self.runner.current_step_id {
             Some(id) => id,
             None => {
-                ui.colored_label(Color32::GREEN, "🏁 Диагностика успешно завершена!");
+                ui.colored_label(Color32::GREEN, lang.diag_complete());
                 ui.add_space(8.0);
-                if ui.button("🔄 Начать сначала").clicked() {
+                if ui.button(lang.start_over()).clicked() {
                     self.reset_runner();
                 }
                 return;
@@ -689,7 +1041,7 @@ impl AlgoApp {
 
         if let Some(step) = current_step {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.colored_label(Color32::from_rgb(255, 200, 50), format!("Текущий узел: {}", step.title));
+                ui.colored_label(Color32::from_rgb(255, 200, 50), format!("{} {}", lang.current_node_label(), step.title));
                 ui.add_space(6.0);
 
                 if !step.description.is_empty() {
@@ -698,7 +1050,7 @@ impl AlgoApp {
 
                 if let Some(path) = &step.image_path {
                     ui.add_space(8.0);
-                    ui.add(egui::Image::new(format!("file://{}", path)).max_width(ui.available_width()).rounding(6.0));
+                    ui.add(egui::Image::new(to_image_uri(path)).max_width(ui.available_width()).rounding(6.0));
                 }
 
                 ui.add_space(12.0);
@@ -706,10 +1058,10 @@ impl AlgoApp {
 
                 match &step.kind {
                     StepKind::Standard => {
-                        ui.label("Выберите вариант перехода:");
+                        ui.label(lang.choose_action());
                         if step.options.is_empty() {
-                            ui.colored_label(Color32::GREEN, "✔ Финальная точка алгоритма.");
-                            if ui.button("Завершить диагностику").clicked() {
+                            ui.colored_label(Color32::GREEN, lang.final_point());
+                            if ui.button(lang.finish_diag_btn()).clicked() {
                                 self.navigate_runner(None);
                             }
                         } else {
@@ -722,7 +1074,11 @@ impl AlgoApp {
                     }
 
                     StepKind::Measurement { unit, min_val, max_val, next_if_normal, next_if_abnormal } => {
-                        ui.label(format!("Замер (допуск: {} ... {} {}):", min_val, max_val, unit));
+                        let prompt = match lang {
+                            Language::Ru => format!("Замер (допуск: {} ... {} {}):", min_val, max_val, unit),
+                            Language::En => format!("Measurement (tolerance: {} ... {} {}):", min_val, max_val, unit),
+                        };
+                        ui.label(prompt);
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.runner.measurement_input);
                             ui.label(unit);
@@ -731,13 +1087,17 @@ impl AlgoApp {
                         if let Ok(val) = self.runner.measurement_input.trim().parse::<f64>() {
                             let in_range = val >= *min_val && val <= *max_val;
                             if in_range {
-                                ui.colored_label(Color32::GREEN, format!("✔ {} {} в допуске.", val, unit));
-                                if ui.button("Принять: В норме ➔").clicked() {
+                                ui.colored_label(Color32::GREEN, format!("✔ {} {} {}", val, unit, lang.in_range_msg()));
+                                if ui.button(lang.accept_normal()).clicked() {
                                     self.navigate_runner(*next_if_normal);
                                 }
                             } else {
-                                ui.colored_label(Color32::LIGHT_RED, format!("❌ Отклонение! (Норма: {} - {} {})", min_val, max_val, unit));
-                                if ui.button("Принять: Отклонение ➔").clicked() {
+                                let err_msg = match lang {
+                                    Language::Ru => format!("❌ Отклонение! (Норма: {} - {} {})", min_val, max_val, unit),
+                                    Language::En => format!("❌ Abnormal! (Tolerance: {} - {} {})", min_val, max_val, unit),
+                                };
+                                ui.colored_label(Color32::LIGHT_RED, err_msg);
+                                if ui.button(lang.accept_abnormal()).clicked() {
                                     self.navigate_runner(*next_if_abnormal);
                                 }
                             }
@@ -750,13 +1110,13 @@ impl AlgoApp {
                             .rounding(4.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {
-                                ui.colored_label(Color32::YELLOW, "⚠ ТРЕБОВАНИЕ БЕЗОПАСНОСТИ");
+                                ui.colored_label(Color32::YELLOW, lang.safety_title());
                                 ui.checkbox(&mut self.runner.safety_acknowledged, ack_text);
                             });
 
                         ui.add_space(8.0);
                         ui.add_enabled_ui(self.runner.safety_acknowledged, |ui| {
-                            if ui.button("Подтвердить и продолжить ➔").clicked() {
+                            if ui.button(lang.confirm_and_proceed()).clicked() {
                                 self.navigate_runner(*next_step_id);
                             }
                         });
@@ -767,10 +1127,11 @@ impl AlgoApp {
     }
 
     fn render_inspector(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Параметры шага");
+        let lang = self.settings.language;
+        ui.heading(lang.inspector_heading());
         ui.separator();
 
-        let step_lookup: Vec<(Option<Uuid>, String)> = std::iter::once((None, "🏁 Завершить диагностику".to_string()))
+        let step_lookup: Vec<(Option<Uuid>, String)> = std::iter::once((None, lang.finish_diag().to_string()))
             .chain(self.active_algo.steps.iter().map(|s| (Some(s.id), s.title.clone())))
             .collect();
 
@@ -781,20 +1142,20 @@ impl AlgoApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut is_start = Some(step.id) == self.active_algo.first_step_id;
-                    if ui.checkbox(&mut is_start, "🚩 Стартовый узел").changed() && is_start {
+                    if ui.checkbox(&mut is_start, lang.start_node()).changed() && is_start {
                         self.active_algo.first_step_id = Some(step.id);
                     }
-                    if ui.button("🗑 Удалить (Del)").clicked() {
+                    if ui.button(lang.delete_btn()).clicked() {
                         step_to_delete = Some(step.id);
                     }
                 });
 
                 ui.add_space(6.0);
-                ui.label("Название блока:");
+                ui.label(lang.block_title());
                 ui.text_edit_singleline(&mut step.title);
 
                 ui.add_space(4.0);
-                ui.label("Тип поведения:");
+                ui.label(lang.behavior_type());
                 let mut kind_idx = match step.kind {
                     StepKind::Standard => 0,
                     StepKind::Measurement { .. } => 1,
@@ -803,29 +1164,32 @@ impl AlgoApp {
                 let old_idx = kind_idx;
                 egui::ComboBox::from_id_source("inspector_kind_select")
                     .selected_text(match kind_idx {
-                        0 => "Обычный выбор действий",
-                        1 => "Замер параметра",
-                        2 => "Техника безопасности",
+                        0 => lang.kind_standard(),
+                        1 => lang.kind_measurement(),
+                        2 => lang.kind_safety(),
                         _ => "",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut kind_idx, 0, "Обычный выбор действий");
-                        ui.selectable_value(&mut kind_idx, 1, "Замер параметра");
-                        ui.selectable_value(&mut kind_idx, 2, "Техника безопасности");
+                        ui.selectable_value(&mut kind_idx, 0, lang.kind_standard());
+                        ui.selectable_value(&mut kind_idx, 1, lang.kind_measurement());
+                        ui.selectable_value(&mut kind_idx, 2, lang.kind_safety());
                     });
 
                 if kind_idx != old_idx {
                     step.kind = match kind_idx {
                         0 => StepKind::Standard,
                         1 => StepKind::Measurement {
-                            unit: "В".to_string(),
+                            unit: match lang { Language::Ru => "В".to_string(), Language::En => "V".to_string() },
                             min_val: 200.0,
                             max_val: 240.0,
                             next_if_normal: None,
                             next_if_abnormal: None,
                         },
                         2 => StepKind::SafetyWarning {
-                            ack_text: "Оборудование обесточено".to_string(),
+                            ack_text: match lang {
+                                Language::Ru => "Оборудование обесточено".to_string(),
+                                Language::En => "Equipment de-energized".to_string(),
+                            },
                             next_step_id: None,
                         },
                         _ => StepKind::Standard,
@@ -833,14 +1197,14 @@ impl AlgoApp {
                 }
 
                 ui.add_space(6.0);
-                ui.label("Инструкция специалисту:");
+                ui.label(lang.instructions());
                 ui.text_edit_multiline(&mut step.description);
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("📷 Фото").clicked() {
+                    if ui.button(lang.photo_btn()).clicked() {
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Изображения", &["png", "jpg", "jpeg"])
+                            .add_filter("Images", &["png", "jpg", "jpeg"])
                             .pick_file() 
                         {
                             step.image_path = Some(path.display().to_string());
@@ -852,17 +1216,17 @@ impl AlgoApp {
                 });
 
                 if let Some(path) = &step.image_path {
-                    ui.add(egui::Image::new(format!("file://{}", path)).max_width(240.0).rounding(4.0));
+                    ui.add(egui::Image::new(to_image_uri(path)).max_width(240.0).rounding(4.0));
                 }
 
                 ui.separator();
-                ui.heading("Связи (Стрелки)");
+                ui.heading(lang.links_heading());
 
                 match &mut step.kind {
                     StepKind::Standard => {
-                        if ui.button("➕ Добавить ветку").clicked() {
+                        if ui.button(lang.add_branch()).clicked() {
                             step.options.push(OptionLink {
-                                text: "Да".to_string(),
+                                text: match lang { Language::Ru => "Да".to_string(), Language::En => "Yes".to_string() },
                                 next_step_id: None,
                             });
                         }
@@ -871,7 +1235,7 @@ impl AlgoApp {
                         for (idx, opt) in step.options.iter_mut().enumerate() {
                             ui.group(|ui| {
                                 ui.horizontal(|ui| {
-                                    ui.label("Текст:");
+                                    ui.label(lang.branch_text());
                                     ui.text_edit_singleline(&mut opt.text);
                                     if ui.button("✖").clicked() {
                                         opt_to_del = Some(idx);
@@ -882,7 +1246,7 @@ impl AlgoApp {
                                     .iter()
                                     .find(|(id, _)| *id == opt.next_step_id)
                                     .map(|(_, t)| t.as_str())
-                                    .unwrap_or("Не выбрано");
+                                    .unwrap_or(lang.not_selected());
 
                                 egui::ComboBox::from_id_source(format!("combo_{}_{}", step.id, idx))
                                     .selected_text(cur_title)
@@ -900,18 +1264,18 @@ impl AlgoApp {
 
                     StepKind::Measurement { unit, min_val, max_val, next_if_normal, next_if_abnormal } => {
                         ui.horizontal(|ui| {
-                            ui.label("Ед. изм:");
+                            ui.label(lang.unit());
                             ui.text_edit_singleline(unit);
                         });
                         ui.horizontal(|ui| {
-                            ui.label("Мин:");
+                            ui.label(lang.min_val());
                             ui.add(egui::DragValue::new(min_val).speed(0.1));
-                            ui.label("Макс:");
+                            ui.label(lang.max_val());
                             ui.add(egui::DragValue::new(max_val).speed(0.1));
                         });
 
-                        ui.label("➔ В норме перейти на:");
-                        let norm_title = step_lookup.iter().find(|(id, _)| *id == *next_if_normal).map(|(_, t)| t.as_str()).unwrap_or("Не выбрано");
+                        ui.label(lang.goto_normal());
+                        let norm_title = step_lookup.iter().find(|(id, _)| *id == *next_if_normal).map(|(_, t)| t.as_str()).unwrap_or(lang.not_selected());
                         egui::ComboBox::from_id_source(format!("norm_{}", step.id))
                             .selected_text(norm_title)
                             .show_ui(ui, |ui| {
@@ -920,8 +1284,8 @@ impl AlgoApp {
                                 }
                             });
 
-                        ui.label("➔ При отклонении перейти на:");
-                        let abn_title = step_lookup.iter().find(|(id, _)| *id == *next_if_abnormal).map(|(_, t)| t.as_str()).unwrap_or("Не выбрано");
+                        ui.label(lang.goto_abnormal());
+                        let abn_title = step_lookup.iter().find(|(id, _)| *id == *next_if_abnormal).map(|(_, t)| t.as_str()).unwrap_or(lang.not_selected());
                         egui::ComboBox::from_id_source(format!("abn_{}", step.id))
                             .selected_text(abn_title)
                             .show_ui(ui, |ui| {
@@ -932,10 +1296,10 @@ impl AlgoApp {
                     }
 
                     StepKind::SafetyWarning { ack_text, next_step_id } => {
-                        ui.label("Подтверждение ТБ:");
+                        ui.label(lang.safety_ack());
                         ui.text_edit_singleline(ack_text);
-                        ui.label("➔ После подтверждения переход:");
-                        let next_title = step_lookup.iter().find(|(id, _)| *id == *next_step_id).map(|(_, t)| t.as_str()).unwrap_or("Не выбрано");
+                        ui.label(lang.goto_after_ack());
+                        let next_title = step_lookup.iter().find(|(id, _)| *id == *next_step_id).map(|(_, t)| t.as_str()).unwrap_or(lang.not_selected());
                         egui::ComboBox::from_id_source(format!("safe_{}", step.id))
                             .selected_text(next_title)
                             .show_ui(ui, |ui| {
@@ -947,17 +1311,12 @@ impl AlgoApp {
                 }
             });
         } else {
-            ui.label("Нажмите на любой блок на схеме, чтобы настроить его параметры.");
+            ui.label(lang.select_node_hint());
         }
 
         if let Some(del_id) = step_to_delete {
             self.delete_step(del_id);
         }
-    }
-
-    fn render_archive(&mut self, ui: &mut egui::Ui) {
-        ui.heading("📚 Архив регламентов");
-        ui.label("Здесь будут отображаться сохраненные файлы оборудования.");
     }
 }
 
