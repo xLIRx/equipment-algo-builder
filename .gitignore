@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+**/*.rs.bk
+
+# Локальный архив алгоритмов и настройки
+archive/
+settings.json
