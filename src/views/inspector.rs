@@ -2,7 +2,7 @@ use crate::app::AlgoApp;
 use crate::models::{OptionLink, StepKind};
 use crate::settings::{ui_kbd, AppTheme};
 use crate::storage::to_image_uri;
-use eframe::egui::{self, Color32, Stroke};
+use eframe::egui::{self, Color32, Stroke, Vec2};
 use uuid::Uuid;
 
 impl AlgoApp {
@@ -40,6 +40,7 @@ impl AlgoApp {
 
         let mut do_delete = false;
         let mut make_start_id: Option<Uuid> = None;
+        let mut enter_sub_id: Option<Uuid> = None;
         let is_curr_start =
             single_selected_id.map_or(false, |id| self.active_algo.first_step_id == Some(id));
 
@@ -111,6 +112,7 @@ impl AlgoApp {
                             StepKind::Standard => 0,
                             StepKind::Measurement { .. } => 1,
                             StepKind::SafetyWarning { .. } => 2,
+                            StepKind::Subprocess { .. } => 3,
                         };
                         let old_idx = kind_idx;
                         egui::ComboBox::from_id_source("inspector_kind_select")
@@ -118,12 +120,14 @@ impl AlgoApp {
                                 0 => lang.kind_standard(),
                                 1 => lang.kind_measurement(),
                                 2 => lang.kind_safety(),
+                                3 => lang.kind_subprocess(),
                                 _ => "",
                             })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut kind_idx, 0, lang.kind_standard());
                                 ui.selectable_value(&mut kind_idx, 1, lang.kind_measurement());
                                 ui.selectable_value(&mut kind_idx, 2, lang.kind_safety());
+                                ui.selectable_value(&mut kind_idx, 3, lang.kind_subprocess());
                             });
 
                         if kind_idx != old_idx {
@@ -140,13 +144,18 @@ impl AlgoApp {
                                     ack_text: lang.default_safety_ack().to_string(),
                                     next_step_id: None,
                                 },
+                                3 => StepKind::Subprocess {
+                                    sub_algo: Box::new(crate::models::Algorithm::default()),
+                                    next_if_success: None,
+                                    next_if_failure: None,
+                                },
                                 _ => StepKind::Standard,
                             };
                         }
                     });
                     ui.add_space(6.0_f32);
 
-                    // Карточка 2: Инструкция специалисту и прикрепленное фото
+                    // Карточка 2: Инструкция и фото
                     card_frame.show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(lang.section_instructions())
@@ -333,6 +342,64 @@ impl AlgoApp {
                                         }
                                     });
                             }
+
+                            StepKind::Subprocess {
+                                sub_algo,
+                                next_if_success,
+                                next_if_failure,
+                            } => {
+                                ui.colored_label(
+                                    if is_dark {
+                                        Color32::from_rgb(192, 132, 252)
+                                    } else {
+                                        Color32::from_rgb(147, 51, 234)
+                                    },
+                                    lang.subprocess_steps_count(sub_algo.steps.len()),
+                                );
+                                ui.add_space(4.0_f32);
+
+                                let enter_btn = egui::Button::new(
+                                    egui::RichText::new(lang.btn_enter_subprocess())
+                                        .color(Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(Color32::from_rgb(147, 51, 234))
+                                .min_size(Vec2::new(ui.available_width(), 32.0_f32));
+
+                                if ui.add(enter_btn).clicked() {
+                                    enter_sub_id = Some(step.id);
+                                }
+
+                                ui.add_space(8.0_f32);
+                                ui.label(lang.goto_sub_success());
+                                let ok_title = step_lookup
+                                    .iter()
+                                    .find(|(id, _)| *id == *next_if_success)
+                                    .map(|(_, t)| t.as_str())
+                                    .unwrap_or(lang.not_selected());
+                                egui::ComboBox::from_id_source(format!("sub_ok_{}", step.id))
+                                    .selected_text(ok_title)
+                                    .show_ui(ui, |ui| {
+                                        for (id_opt, title) in &step_lookup {
+                                            ui.selectable_value(next_if_success, *id_opt, title);
+                                        }
+                                    });
+
+                                ui.add_space(4.0_f32);
+                                ui.label(lang.goto_sub_failure());
+                                let fail_title = step_lookup
+                                    .iter()
+                                    .find(|(id, _)| *id == *next_if_failure)
+                                    .map(|(_, t)| t.as_str())
+                                    .unwrap_or(lang.not_selected());
+                                egui::ComboBox::from_id_source(format!("sub_fail_{}", step.id))
+                                    .selected_text(fail_title)
+                                    .show_ui(ui, |ui| {
+                                        for (id_opt, title) in &step_lookup {
+                                            ui.selectable_value(next_if_failure, *id_opt, title);
+                                        }
+                                    });
+                            }
                         }
                     });
                 });
@@ -406,6 +473,9 @@ impl AlgoApp {
         if let Some(id) = make_start_id {
             self.snapshot_for_undo();
             self.active_algo.first_step_id = Some(id);
+        }
+        if let Some(id) = enter_sub_id {
+            self.enter_subprocess(id);
         }
         if do_delete {
             self.delete_selected();

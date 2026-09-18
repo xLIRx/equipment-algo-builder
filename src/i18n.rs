@@ -1061,4 +1061,101 @@ impl Language {
             Language::En => "Confirm & Proceed ➔",
         }
     }
+    pub fn btn_auto_layout(&self) -> &'static str {
+        match self {
+            Language::Ru => "🪄 Выровнять",
+            Language::En => "🪄 Auto-layout",
+        }
+    }
+    pub fn auto_layout_tip(&self) -> &'static str {
+        match self {
+            Language::Ru => "Автоматическая иерархическая расстановка блоков схемы сверху вниз",
+            Language::En => "Automatically arrange blocks hierarchically from top to bottom",
+        }
+    }
+    pub fn status_auto_layout_done(&self) -> &'static str {
+        match self {
+            Language::Ru => "✔ Схема автоматически выровнена!",
+            Language::En => "✔ Flowchart auto-arranged!",
+        }
+    }
+    // Подпроцессы
+    pub fn kind_subprocess(&self) -> &'static str {
+        match self {
+            Language::Ru => "Вложенный подпроцесс (композитный блок)",
+            Language::En => "Subprocess (composite block)",
+        }
+    }
+    pub fn badge_subprocess(&self) -> &'static str {
+        match self {
+            Language::Ru => "ПОДПРОЦЕСС ⮯",
+            Language::En => "SUBPROCESS ⮯",
+        }
+    }
+    pub fn btn_enter_subprocess(&self) -> &'static str {
+        match self {
+            Language::Ru => "⮯ Войти в подпроцесс",
+            Language::En => "⮯ Open Subprocess",
+        }
+    }
+    pub fn goto_after_subprocess(&self) -> &'static str {
+        match self {
+            Language::Ru => "➔ После завершения подпроцесса перейти к:",
+            Language::En => "➔ After subprocess completion go to:",
+        }
+    }
+    pub fn crumb_root(&self) -> &'static str {
+        match self {
+            Language::Ru => "Главный регламент",
+            Language::En => "Root Procedure",
+        }
+    }
+    pub fn btn_return_to_parent(&self) -> &'static str {
+        match self {
+            Language::Ru => "⬆ Вернуться на уровень выше",
+            Language::En => "⬆ Return to Parent Flow",
+        }
+    }
+    pub fn subprocess_steps_count(&self, count: usize) -> String {
+        match self {
+            Language::Ru => format!("Шагов внутри: {}", count),
+            Language::En => format!("Internal steps: {}", count),
+        }
+    }
+    pub fn run_finish_subprocess(&self) -> &'static str {
+        match self {
+            Language::Ru => "✔ Подпроцесс завершен. Вернуться к основному ➔",
+            Language::En => "✔ Subprocess done. Return to Main ➔",
+        }
+    }
+    pub fn link_sub_success(&self) -> &'static str {
+        match self {
+            Language::Ru => "Успех (Норма)",
+            Language::En => "Success (Pass)",
+        }
+    }
+    pub fn link_sub_failure(&self) -> &'static str {
+        match self {
+            Language::Ru => "Дефект (Сбой)",
+            Language::En => "Defect (Fail)",
+        }
+    }
+    pub fn goto_sub_success(&self) -> &'static str {
+        match self {
+            Language::Ru => "➔ При успешном завершении (без отклонений):",
+            Language::En => "➔ On success (no abnormalities):",
+        }
+    }
+    pub fn goto_sub_failure(&self) -> &'static str {
+        match self {
+            Language::Ru => "➔ При обнаружении дефектов/отклонений:",
+            Language::En => "➔ On defect / abnormal readings:",
+        }
+    }
+    pub fn runner_sub_executing(&self) -> &'static str {
+        match self {
+            Language::Ru => "Выполнение подпроцесса",
+            Language::En => "Subprocess execution",
+        }
+    }
 }

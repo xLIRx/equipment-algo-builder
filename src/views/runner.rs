@@ -7,6 +7,13 @@ use uuid::Uuid;
 
 impl AlgoApp {
     pub fn reset_runner(&mut self) {
+        // Если находились внутри подпроцесса, возвращаемся в корневой алгоритм
+        if let Some(first_frame) = self.runner.call_stack.first().cloned() {
+            self.active_algo = first_frame.parent_algo;
+        }
+
+        self.runner.call_stack.clear();
+        self.runner.had_abnormality = false;
         self.runner.current_step_id = self.active_algo.first_step_id;
         self.runner.history.clear();
         self.runner.measurement_input.clear();
@@ -23,6 +30,80 @@ impl AlgoApp {
         if let Some(curr) = self.runner.current_step_id {
             self.runner.history.push(curr);
         }
+
+        // 1. АВТО-ВХОД В ПОДПРОЦЕСС
+        if let Some(nid) = next_id {
+            if let Some(step) = self.active_algo.steps.iter().find(|s| s.id == nid) {
+                if let StepKind::Subprocess { sub_algo, .. } = &step.kind {
+                    let sub_algo_clone = (**sub_algo).clone();
+                    let first_step = sub_algo_clone.first_step_id;
+                    let parent_algo = self.active_algo.clone();
+                    let parent_history = std::mem::take(&mut self.runner.history);
+
+                    self.runner.call_stack.push(crate::app::RunnerCallFrame {
+                        parent_step_id: nid,
+                        parent_algo,
+                        parent_history,
+                        had_abnormality: self.runner.had_abnormality,
+                    });
+
+                    self.runner.had_abnormality = false;
+                    self.active_algo = sub_algo_clone;
+                    self.runner.current_step_id = first_step;
+                    self.runner.measurement_input.clear();
+                    self.runner.safety_acknowledged = false;
+
+                    if let Some(id) = first_step {
+                        if let Some(rect) = self.last_canvas_rect {
+                            self.focus_step_on_canvas(id, rect.size());
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // 2. АВТО-ВЫХОД ИЗ ПОДПРОЦЕССА (если дошли до тупика/конца)
+        if next_id.is_none() && !self.runner.call_stack.is_empty() {
+            if let Some(frame) = self.runner.call_stack.pop() {
+                let sub_had_abnormality = self.runner.had_abnormality;
+                let parent_algo = frame.parent_algo;
+                let parent_step_id = frame.parent_step_id;
+
+                let mut return_target = None;
+                if let Some(step) = parent_algo.steps.iter().find(|s| s.id == parent_step_id) {
+                    if let StepKind::Subprocess {
+                        next_if_success,
+                        next_if_failure,
+                        ..
+                    } = &step.kind
+                    {
+                        return_target = if sub_had_abnormality {
+                            *next_if_failure
+                        } else {
+                            *next_if_success
+                        };
+                    }
+                }
+
+                self.active_algo = parent_algo;
+                self.runner.history = frame.parent_history;
+                self.runner.history.push(parent_step_id);
+                self.runner.had_abnormality = frame.had_abnormality || sub_had_abnormality;
+                self.runner.current_step_id = return_target;
+                self.runner.measurement_input.clear();
+                self.runner.safety_acknowledged = false;
+
+                if let Some(id) = return_target {
+                    if let Some(rect) = self.last_canvas_rect {
+                        self.focus_step_on_canvas(id, rect.size());
+                    }
+                }
+                return;
+            }
+        }
+
+        // Обычный переход
         self.runner.current_step_id = next_id;
         self.runner.measurement_input.clear();
         self.runner.safety_acknowledged = false;
@@ -42,6 +123,18 @@ impl AlgoApp {
 
             if let Some(rect) = self.last_canvas_rect {
                 self.focus_step_on_canvas(prev, rect.size());
+            }
+        } else if let Some(frame) = self.runner.call_stack.pop() {
+            // Откат назад через границу подпроцесса в родительский граф
+            self.active_algo = frame.parent_algo;
+            self.runner.history = frame.parent_history;
+            self.runner.had_abnormality = frame.had_abnormality;
+            self.runner.current_step_id = Some(frame.parent_step_id);
+            self.runner.measurement_input.clear();
+            self.runner.safety_acknowledged = false;
+
+            if let Some(rect) = self.last_canvas_rect {
+                self.focus_step_on_canvas(frame.parent_step_id, rect.size());
             }
         }
     }
@@ -404,6 +497,53 @@ impl AlgoApp {
                         }
                     }
 
+                    StepKind::Subprocess {
+                        sub_algo,
+                        next_if_success: _,
+                        next_if_failure: _,
+                    } => {
+                        egui::Frame::none()
+                            .fill(if is_dark {
+                                Color32::from_rgb(38, 26, 54)
+                            } else {
+                                Color32::from_rgb(250, 245, 255)
+                            })
+                            .stroke(Stroke::new(
+                                1.0_f32,
+                                if is_dark {
+                                    Color32::from_rgb(90, 50, 130)
+                                } else {
+                                    Color32::from_rgb(192, 132, 252)
+                                },
+                            ))
+                            .rounding(4.0_f32)
+                            .inner_margin(10.0_f32)
+                            .show(ui, |ui| {
+                                ui.colored_label(
+                                    if is_dark {
+                                        Color32::from_rgb(216, 180, 254)
+                                    } else {
+                                        Color32::from_rgb(147, 51, 234)
+                                    },
+                                    lang.badge_subprocess(),
+                                );
+                                ui.label(lang.subprocess_steps_count(sub_algo.steps.len()));
+                            });
+
+                        ui.add_space(8.0_f32);
+                        let enter_btn = egui::Button::new(
+                            egui::RichText::new(lang.btn_enter_subprocess())
+                                .color(Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(147, 51, 234))
+                        .min_size(Vec2::new(ui.available_width(), 38.0_f32));
+
+                        if ui.add(enter_btn).clicked() {
+                            self.navigate_runner(Some(step.id));
+                        }
+                    }
+
                     StepKind::Measurement {
                         unit,
                         min_val,
@@ -466,6 +606,7 @@ impl AlgoApp {
                                 if ui.add(reject_btn).clicked()
                                     || ui.input(|i| i.key_pressed(egui::Key::Enter))
                                 {
+                                    self.runner.had_abnormality = true;
                                     self.navigate_runner(*next_if_abnormal);
                                 }
                             }

@@ -23,6 +23,23 @@ pub fn build_connector_letter_map(
 
         let mut targets = Vec::new();
         match &step.kind {
+            crate::models::StepKind::SafetyWarning { next_step_id, .. } => {
+                if let Some(nid) = next_step_id {
+                    targets.push(*nid);
+                }
+            }
+            crate::models::StepKind::Subprocess {
+                next_if_success,
+                next_if_failure,
+                ..
+            } => {
+                if let Some(sid) = next_if_success {
+                    targets.push(*sid);
+                }
+                if let Some(fid) = next_if_failure {
+                    targets.push(*fid);
+                }
+            }
             crate::models::StepKind::Standard => {
                 for opt in &step.options {
                     if let Some(tid) = opt.next_step_id {
@@ -40,11 +57,6 @@ pub fn build_connector_letter_map(
                 }
                 if let Some(aid) = next_if_abnormal {
                     targets.push(*aid);
-                }
-            }
-            crate::models::StepKind::SafetyWarning { next_step_id, .. } => {
-                if let Some(nid) = next_step_id {
-                    targets.push(*nid);
                 }
             }
         }

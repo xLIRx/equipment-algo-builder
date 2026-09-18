@@ -63,6 +63,12 @@ pub enum StepKind {
         ack_text: String,
         next_step_id: Option<Uuid>,
     },
+    // Вложенный подпроцесс с раздельным выходом "Успех" / "Дефект"
+    Subprocess {
+        sub_algo: Box<Algorithm>,
+        next_if_success: Option<Uuid>,
+        next_if_failure: Option<Uuid>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

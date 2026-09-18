@@ -1,4 +1,5 @@
 pub mod connectors;
+pub mod layout;
 pub mod wires;
 
 use crate::app::{AlgoApp, ContextMenuState};
@@ -7,9 +8,19 @@ use crate::canvas::wires::*;
 use crate::models::{Step, StepKind, WireStyle};
 use crate::settings::{AppTheme, GRID_SNAP_STEP};
 use eframe::egui::{self, Color32, FontId, PointerButton, Pos2, Rect, Stroke, Vec2};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 impl AlgoApp {
+    pub fn apply_auto_layout(&mut self) {
+        self.snapshot_for_undo();
+        crate::canvas::layout::auto_layout_algorithm(
+            &mut self.active_algo,
+            self.settings.snap_to_grid,
+        );
+        self.set_status(self.settings.language.status_auto_layout_done().to_string());
+    }
+
     pub fn render_canvas(&mut self, ui: &mut egui::Ui, is_test_mode: bool) {
         let (response, painter) = ui.allocate_painter(
             ui.available_size_before_wrap(),
@@ -54,7 +65,7 @@ impl AlgoApp {
             .latest_pos()
             .map_or(false, |pos| minimap_rect.contains(pos));
 
-        // Масштабирование колесиком мыши
+        // Масштабирование
         let scroll_delta_y = ui.input(|i| i.raw_scroll_delta.y);
         if is_in_canvas
             && scroll_delta_y.abs() > 0.1_f32
@@ -69,7 +80,7 @@ impl AlgoApp {
             }
         }
 
-        // Панорамирование холста СКМ
+        // Панорамирование
         if pointer.middle_down() && is_in_canvas && !self.show_close_modal {
             self.target_pan = None;
             let delta = pointer.delta();
@@ -80,7 +91,7 @@ impl AlgoApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::AllScroll);
         }
 
-        // Точечная сетка
+        // Сетка
         let grid_size = 36.0_f32 * self.canvas_zoom;
         let (dot_color, dot_radius) = if is_dark {
             (Color32::from_rgba_unmultiplied(80, 100, 130, 80), 1.2_f32)
@@ -101,7 +112,7 @@ impl AlgoApp {
             }
         }
 
-        // Экран пустого состояния (первый запуск)
+        // Пустой холст
         if self.active_algo.steps.is_empty() && !is_test_mode {
             let card_size = Vec2::new(420.0_f32, 220.0_f32);
             let card_rect = Rect::from_center_size(canvas_rect.center(), card_size);
@@ -191,7 +202,7 @@ impl AlgoApp {
             node_rects.push((step.id, Rect::from_min_size(screen_pos, node_size)));
         }
 
-        // Двойной клик ЛКМ — создать блок
+        // Двойной клик
         if !is_test_mode
             && !self.show_close_modal
             && is_in_canvas
@@ -200,8 +211,25 @@ impl AlgoApp {
         {
             if pointer.button_double_clicked(PointerButton::Primary) {
                 if let Some(pos) = pointer.latest_pos() {
-                    let hit_any = node_rects.iter().any(|(_, r)| r.contains(pos));
-                    if !hit_any {
+                    let hit_step = self
+                        .active_algo
+                        .steps
+                        .iter()
+                        .find(|s| {
+                            let screen_pos = Pos2::new(
+                                s.pos[0] * self.canvas_zoom + self.canvas_pan.x,
+                                s.pos[1] * self.canvas_zoom + self.canvas_pan.y,
+                            );
+                            Rect::from_min_size(screen_pos, node_size).contains(pos)
+                        })
+                        .map(|s| (s.id, s.kind.clone()));
+
+                    if let Some((step_id, StepKind::Subprocess { .. })) = hit_step {
+                        self.enter_subprocess(step_id);
+                        return;
+                    }
+
+                    if hit_step.is_none() {
                         self.snapshot_for_undo();
                         let count = self.active_algo.steps.len() + 1;
                         let mut world_x = (pos.x - self.canvas_pan.x) / self.canvas_zoom;
@@ -225,7 +253,7 @@ impl AlgoApp {
             }
         }
 
-        // Перетаскивание и выделение блоков
+        // Перетаскивание и выделение
         if !is_test_mode && !self.show_close_modal {
             if pointer.primary_pressed() && is_in_canvas && !clicked_in_menu && !clicked_in_minimap
             {
@@ -236,7 +264,7 @@ impl AlgoApp {
                     let mut started_wire = false;
                     for (id, r) in &node_rects {
                         let port_out = Pos2::new(r.center().x, r.max.y);
-                        if pos.distance(port_out) <= 12.0_f32 * self.canvas_zoom {
+                        if pos.distance(port_out) <= 14.0_f32 * self.canvas_zoom {
                             self.wire_drag_source_id = Some(*id);
                             started_wire = true;
                             break;
@@ -364,7 +392,6 @@ impl AlgoApp {
             && !clicked_in_minimap
             && !self.show_close_modal;
 
-        // В РЕЖИМЕ ДИАГНОСТИКИ ПКМ ПОЛНОСТЬЮ БЛОКИРУЕТСЯ
         let right_clicked = !is_test_mode
             && pointer.secondary_clicked()
             && is_in_canvas
@@ -380,7 +407,7 @@ impl AlgoApp {
         let abn_text = lang.link_abnormal();
         let safe_text = lang.link_safety();
 
-        // 1. СОЕДИНИТЕЛИ ГОСТ (ОБРАТНЫЕ СВЯЗИ A, B, C...)
+        // 1. Соединители ГОСТ
         let target_to_letter = build_connector_letter_map(&self.active_algo.steps, &node_rects);
         draw_incoming_connectors(
             &painter,
@@ -392,13 +419,35 @@ impl AlgoApp {
             is_dark,
         );
 
-        // 2. ОТРИСОВКА СВЯЗЕЙ (ПРЯМЫЕ И ВЫХОДНЫЕ СОЕДИНИТЕЛИ)
+        // 2. Сбор всех прямых связей для пакетной канальной трассировки
+        struct ForwardConnItem {
+            from_id: Uuid,
+            target_id: Uuid,
+            label: String,
+            color: Color32,
+            conn_idx: usize,
+            conn_type: u8,
+            start_pt: Pos2,
+            end_pt: Pos2,
+        }
+
+        let mut forward_conns: Vec<ForwardConnItem> = Vec::new();
+
         for step in &self.active_algo.steps {
             let from_rect = match node_rects.iter().find(|(id, _)| *id == step.id) {
                 Some((_, r)) => *r,
                 None => continue,
             };
-            let start_pt = Pos2::new(from_rect.center().x, from_rect.max.y);
+
+            let left_pin = Pos2::new(
+                from_rect.min.x + 42.0_f32 * self.canvas_zoom,
+                from_rect.max.y,
+            );
+            let right_pin = Pos2::new(
+                from_rect.max.x - 42.0_f32 * self.canvas_zoom,
+                from_rect.max.y,
+            );
+            let center_pin = Pos2::new(from_rect.center().x, from_rect.max.y);
 
             let mut connections = Vec::new();
             match &step.kind {
@@ -410,7 +459,14 @@ impl AlgoApp {
                             } else {
                                 Color32::from_rgb(37, 99, 235)
                             };
-                            connections.push((target_id, opt.text.clone(), link_c, idx, 0));
+                            connections.push((
+                                target_id,
+                                opt.text.clone(),
+                                link_c,
+                                idx,
+                                0,
+                                center_pin,
+                            ));
                         }
                     }
                 }
@@ -419,13 +475,30 @@ impl AlgoApp {
                     next_if_abnormal,
                     ..
                 } => {
+                    let n_tx = next_if_normal
+                        .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                        .map(|(_, r)| r.center().x);
+                    let a_tx = next_if_abnormal
+                        .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                        .map(|(_, r)| r.center().x);
+
+                    let norm_on_left = match (n_tx, a_tx) {
+                        (Some(nx), Some(ax)) => nx <= ax,
+                        (Some(nx), None) => nx <= from_rect.center().x,
+                        (None, Some(ax)) => ax > from_rect.center().x,
+                        (None, None) => true,
+                    };
+
+                    let norm_pin = if norm_on_left { left_pin } else { right_pin };
+                    let abn_pin = if norm_on_left { right_pin } else { left_pin };
+
                     if let Some(nid) = next_if_normal {
                         let norm_c = if is_dark {
                             Color32::from_rgb(60, 210, 130)
                         } else {
                             Color32::from_rgb(16, 185, 129)
                         };
-                        connections.push((*nid, norm_text.to_string(), norm_c, 0, 1));
+                        connections.push((*nid, norm_text.to_string(), norm_c, 0, 1, norm_pin));
                     }
                     if let Some(aid) = next_if_abnormal {
                         let abn_c = if is_dark {
@@ -433,7 +506,7 @@ impl AlgoApp {
                         } else {
                             Color32::from_rgb(220, 38, 38)
                         };
-                        connections.push((*aid, abn_text.to_string(), abn_c, 0, 2));
+                        connections.push((*aid, abn_text.to_string(), abn_c, 1, 2, abn_pin));
                     }
                 }
                 StepKind::SafetyWarning { next_step_id, .. } => {
@@ -443,72 +516,70 @@ impl AlgoApp {
                         } else {
                             Color32::from_rgb(217, 119, 6)
                         };
-                        connections.push((*nid, safe_text.to_string(), safe_c, 0, 3));
+                        connections.push((*nid, safe_text.to_string(), safe_c, 0, 3, center_pin));
+                    }
+                }
+                StepKind::Subprocess {
+                    next_if_success,
+                    next_if_failure,
+                    ..
+                } => {
+                    let s_tx = next_if_success
+                        .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                        .map(|(_, r)| r.center().x);
+                    let f_tx = next_if_failure
+                        .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                        .map(|(_, r)| r.center().x);
+
+                    let succ_on_left = match (s_tx, f_tx) {
+                        (Some(sx), Some(fx)) => sx <= fx,
+                        (Some(sx), None) => sx <= from_rect.center().x,
+                        (None, Some(fx)) => fx > from_rect.center().x,
+                        (None, None) => true,
+                    };
+
+                    let succ_pin = if succ_on_left { left_pin } else { right_pin };
+                    let fail_pin = if succ_on_left { right_pin } else { left_pin };
+
+                    if let Some(sid) = next_if_success {
+                        let ok_c = if is_dark {
+                            Color32::from_rgb(60, 210, 130)
+                        } else {
+                            Color32::from_rgb(16, 185, 129)
+                        };
+                        connections.push((
+                            *sid,
+                            lang.link_sub_success().to_string(),
+                            ok_c,
+                            0,
+                            4,
+                            succ_pin,
+                        ));
+                    }
+                    if let Some(fid) = next_if_failure {
+                        let fail_c = if is_dark {
+                            Color32::from_rgb(255, 90, 90)
+                        } else {
+                            Color32::from_rgb(220, 38, 38)
+                        };
+                        connections.push((
+                            *fid,
+                            lang.link_sub_failure().to_string(),
+                            fail_c,
+                            1,
+                            5,
+                            fail_pin,
+                        ));
                     }
                 }
             }
 
-            let has_selection = !self.selected_step_ids.is_empty();
-
-            for (target_id, label, color, conn_idx, conn_type) in connections {
+            for (target_id, label, color, conn_idx, conn_type, start_pt) in connections {
                 if let Some((_, to_rect)) = node_rects.iter().find(|(id, _)| *id == target_id) {
                     let is_backward = to_rect.center().y < from_rect.center().y - 10.0_f32;
 
-                    let is_outgoing = !is_test_mode && self.selected_step_ids.contains(&step.id);
-                    let is_incoming = !is_test_mode && self.selected_step_ids.contains(&target_id);
-                    let is_highlighted = is_outgoing || is_incoming;
-
-                    let line_color = if is_test_mode {
-                        let is_traversed = self
-                            .runner
-                            .history
-                            .windows(2)
-                            .any(|w| w[0] == step.id && w[1] == target_id)
-                            || (self.runner.history.last() == Some(&step.id)
-                                && self.runner.current_step_id == Some(target_id));
-                        let is_current_outgoing = self.runner.current_step_id == Some(step.id);
-
-                        if is_traversed {
-                            if is_dark {
-                                Color32::from_rgb(60, 225, 110)
-                            } else {
-                                Color32::from_rgb(16, 185, 129)
-                            }
-                        } else if is_current_outgoing {
-                            if is_dark {
-                                Color32::from_rgb(255, 205, 50)
-                            } else {
-                                Color32::from_rgb(217, 119, 6)
-                            }
-                        } else if is_dark {
-                            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40)
-                        } else {
-                            Color32::from_rgba_unmultiplied(148, 163, 184, 80)
-                        }
-                    } else if is_outgoing {
-                        if is_dark {
-                            Color32::from_rgb(255, 205, 50)
-                        } else {
-                            Color32::from_rgb(217, 119, 6)
-                        }
-                    } else if is_incoming {
-                        if is_dark {
-                            Color32::from_rgb(56, 189, 248)
-                        } else {
-                            Color32::from_rgb(2, 132, 199)
-                        }
-                    } else if has_selection {
-                        if is_dark {
-                            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 35)
-                        } else {
-                            Color32::from_rgba_unmultiplied(148, 163, 184, 90)
-                        }
-                    } else {
-                        color
-                    };
-
                     if is_backward {
-                        // Выходной коннектор-кружок A снизу
+                        // Обратные связи оформляем ГОСТ-коннекторами
                         let letter = target_to_letter
                             .get(&target_id)
                             .cloned()
@@ -527,7 +598,7 @@ impl AlgoApp {
                             &letter,
                             &label,
                             target_title,
-                            line_color,
+                            color,
                             &mut self.hovered_connector,
                             self.canvas_zoom,
                             is_dark,
@@ -546,64 +617,141 @@ impl AlgoApp {
                             }
                         }
                     } else {
-                        // Обычная прямая связь сверху вниз
                         let end_pt = Pos2::new(to_rect.center().x, to_rect.min.y);
-                        let conn_key = format!("{}:{}", step.id, target_id);
-                        let wire_style = self
-                            .active_algo
-                            .wire_styles
-                            .get(&conn_key)
-                            .copied()
-                            .unwrap_or(self.settings.default_wire_style);
-
-                        let (badge_rect, segments) = draw_connection_wire(
-                            &painter,
+                        forward_conns.push(ForwardConnItem {
+                            from_id: step.id,
+                            target_id,
+                            label,
+                            color,
+                            conn_idx,
+                            conn_type,
                             start_pt,
                             end_pt,
-                            &label,
-                            line_color,
-                            self.canvas_zoom,
-                            is_dark,
-                            is_highlighted,
-                            wire_style,
-                        );
-
-                        if !is_test_mode && mouse_clicked && self.wire_drag_source_id.is_none() {
-                            if let (Some(b_rect), Some(pos)) = (badge_rect, click_pos) {
-                                if b_rect.contains(pos) {
-                                    link_to_disconnect = Some((step.id, conn_idx, conn_type));
-                                }
-                            }
-                        }
-
-                        if !is_test_mode && right_clicked && wire_to_toggle.is_none() {
-                            if let Some(pos) = click_pos {
-                                let hit_badge =
-                                    badge_rect.map_or(false, |r| r.expand(5.0_f32).contains(pos));
-                                let hit_line = segments.iter().any(|seg| {
-                                    dist_to_segment(pos, seg[0], seg[1])
-                                        <= 6.0_f32 * self.canvas_zoom
-                                });
-
-                                if hit_badge || hit_line {
-                                    wire_to_toggle = Some((conn_key, wire_style));
-                                }
-                            }
-                        }
+                        });
                     }
                 }
             }
         }
 
-        if let Some(target_id) = connector_jump_target {
-            self.focus_step_on_canvas(target_id, canvas_rect.size());
+        // 3. Вычисление непересекающихся Y-треков для всех прямых связей
+        let wire_spans: Vec<(Pos2, Pos2)> = forward_conns
+            .iter()
+            .map(|c| (c.start_pt, c.end_pt))
+            .collect();
+        let computed_mid_ys = compute_channel_mid_ys(&wire_spans, self.canvas_zoom);
+
+        // 4. Отрисовка прямых связей по выделенным трекам
+        let has_selection = !self.selected_step_ids.is_empty();
+
+        for (i, conn) in forward_conns.into_iter().enumerate() {
+            let exact_mid_y = computed_mid_ys[i];
+            let is_outgoing = !is_test_mode && self.selected_step_ids.contains(&conn.from_id);
+            let is_incoming = !is_test_mode && self.selected_step_ids.contains(&conn.target_id);
+            let is_highlighted = is_outgoing || is_incoming;
+
+            let line_color = if is_test_mode {
+                let is_traversed = self
+                    .runner
+                    .history
+                    .windows(2)
+                    .any(|w| w[0] == conn.from_id && w[1] == conn.target_id)
+                    || (self.runner.history.last() == Some(&conn.from_id)
+                        && self.runner.current_step_id == Some(conn.target_id));
+                let is_current_outgoing = self.runner.current_step_id == Some(conn.from_id);
+
+                if is_traversed {
+                    if is_dark {
+                        Color32::from_rgb(60, 225, 110)
+                    } else {
+                        Color32::from_rgb(16, 185, 129)
+                    }
+                } else if is_current_outgoing {
+                    if is_dark {
+                        Color32::from_rgb(255, 205, 50)
+                    } else {
+                        Color32::from_rgb(217, 119, 6)
+                    }
+                } else if is_dark {
+                    Color32::from_rgba_unmultiplied(
+                        conn.color.r(),
+                        conn.color.g(),
+                        conn.color.b(),
+                        40,
+                    )
+                } else {
+                    Color32::from_rgba_unmultiplied(148, 163, 184, 80)
+                }
+            } else if is_outgoing {
+                if is_dark {
+                    Color32::from_rgb(255, 205, 50)
+                } else {
+                    Color32::from_rgb(217, 119, 6)
+                }
+            } else if is_incoming {
+                if is_dark {
+                    Color32::from_rgb(56, 189, 248)
+                } else {
+                    Color32::from_rgb(2, 132, 199)
+                }
+            } else if has_selection {
+                if is_dark {
+                    Color32::from_rgba_unmultiplied(
+                        conn.color.r(),
+                        conn.color.g(),
+                        conn.color.b(),
+                        35,
+                    )
+                } else {
+                    Color32::from_rgba_unmultiplied(148, 163, 184, 90)
+                }
+            } else {
+                conn.color
+            };
+
+            let conn_key = format!("{}:{}", conn.from_id, conn.target_id);
+            let wire_style = self
+                .active_algo
+                .wire_styles
+                .get(&conn_key)
+                .copied()
+                .unwrap_or(self.settings.default_wire_style);
+
+            let (badge_rect, segments) = draw_connection_wire(
+                &painter,
+                conn.start_pt,
+                conn.end_pt,
+                &conn.label,
+                line_color,
+                self.canvas_zoom,
+                is_dark,
+                is_highlighted,
+                wire_style,
+                exact_mid_y,
+            );
+
+            if !is_test_mode && mouse_clicked && self.wire_drag_source_id.is_none() {
+                if let (Some(b_rect), Some(pos)) = (badge_rect, click_pos) {
+                    if b_rect.contains(pos) {
+                        link_to_disconnect = Some((conn.from_id, conn.conn_idx, conn.conn_type));
+                    }
+                }
+            }
+
+            if !is_test_mode && right_clicked && wire_to_toggle.is_none() {
+                if let Some(pos) = click_pos {
+                    let hit_badge = badge_rect.map_or(false, |r| r.expand(5.0_f32).contains(pos));
+                    let hit_line = segments.iter().any(|seg| {
+                        dist_to_segment(pos, seg[0], seg[1]) <= 6.0_f32 * self.canvas_zoom
+                    });
+
+                    if hit_badge || hit_line {
+                        wire_to_toggle = Some((conn_key, wire_style));
+                    }
+                }
+            }
         }
 
-        if pointer.hover_pos().is_none() {
-            self.hovered_connector = None;
-        }
-
-        // Временный провод при вытягивании связи
+        // Временный провод
         if let Some(source_id) = self.wire_drag_source_id {
             if let Some((_, r)) = node_rects.iter().find(|(id, _)| *id == source_id) {
                 if let Some(mouse_pos) = pointer.latest_pos() {
@@ -623,12 +771,13 @@ impl AlgoApp {
                         is_dark,
                         true,
                         self.settings.default_wire_style,
+                        (start_pt.y + mouse_pos.y) * 0.5_f32,
                     );
                 }
             }
         }
 
-        // Разрыв связи (ЛКМ)
+        // Разрыв связи
         if let Some((step_id, idx, conn_type)) = link_to_disconnect {
             self.snapshot_for_undo();
             if let Some(step) = self.active_algo.steps.iter_mut().find(|s| s.id == step_id) {
@@ -656,12 +805,28 @@ impl AlgoApp {
                             *next_step_id = None;
                         }
                     }
+                    4 => {
+                        if let StepKind::Subprocess {
+                            next_if_success, ..
+                        } = &mut step.kind
+                        {
+                            *next_if_success = None;
+                        }
+                    }
+                    5 => {
+                        if let StepKind::Subprocess {
+                            next_if_failure, ..
+                        } = &mut step.kind
+                        {
+                            *next_if_failure = None;
+                        }
+                    }
                     _ => {}
                 }
             }
         }
 
-        // Переключение стиля связи (ПКМ) или вызов контекстного меню
+        // Стиль связи / контекстное меню
         if !is_test_mode {
             if let Some((conn_key, cur_style)) = wire_to_toggle {
                 self.snapshot_for_undo();
@@ -702,7 +867,7 @@ impl AlgoApp {
             }
         }
 
-        // Отрисовка карточек шагов
+        // Карточки шагов
         for (id, rect) in &node_rects {
             let step = match self.active_algo.steps.iter().find(|s| s.id == *id) {
                 Some(s) => s,
@@ -750,6 +915,13 @@ impl AlgoApp {
                             Color32::from_rgb(255, 165, 40)
                         } else {
                             Color32::from_rgb(217, 119, 6)
+                        }
+                    }
+                    StepKind::Subprocess { .. } => {
+                        if is_dark {
+                            Color32::from_rgb(192, 132, 252)
+                        } else {
+                            Color32::from_rgb(147, 51, 234)
                         }
                     }
                 }
@@ -857,7 +1029,7 @@ impl AlgoApp {
                 ),
             );
 
-            // Линтер целостности графа
+            // Линтер
             let mut lint_warning: Option<&'static str> = None;
             if !is_test_mode {
                 let has_incoming = is_start
@@ -881,6 +1053,14 @@ impl AlgoApp {
                             StepKind::SafetyWarning { next_step_id, .. } => {
                                 *next_step_id == Some(step.id)
                             }
+                            StepKind::Subprocess {
+                                next_if_success,
+                                next_if_failure,
+                                ..
+                            } => {
+                                *next_if_success == Some(step.id)
+                                    || *next_if_failure == Some(step.id)
+                            }
                         });
 
                 if !has_incoming {
@@ -897,6 +1077,11 @@ impl AlgoApp {
                             ..
                         } => next_if_normal.is_none() || next_if_abnormal.is_none(),
                         StepKind::SafetyWarning { next_step_id, .. } => next_step_id.is_none(),
+                        StepKind::Subprocess {
+                            next_if_success,
+                            next_if_failure,
+                            ..
+                        } => next_if_success.is_none() || next_if_failure.is_none(),
                     };
                     if has_unlinked_branch {
                         lint_warning = Some(lang.lint_incomplete());
@@ -961,6 +1146,7 @@ impl AlgoApp {
                     StepKind::Standard => lang.badge_choice(),
                     StepKind::Measurement { .. } => lang.badge_measure(),
                     StepKind::SafetyWarning { .. } => lang.badge_safety(),
+                    StepKind::Subprocess { .. } => lang.badge_subprocess(),
                 }
             };
 
@@ -1027,6 +1213,19 @@ impl AlgoApp {
                 );
             }
 
+            if let StepKind::Subprocess { sub_algo, .. } = &step.kind {
+                painter.text(
+                    Pos2::new(
+                        rect.min.x + 12.0_f32 * self.canvas_zoom,
+                        rect.min.y + 55.0_f32 * self.canvas_zoom,
+                    ),
+                    egui::Align2::LEFT_TOP,
+                    lang.subprocess_steps_count(sub_algo.steps.len()),
+                    FontId::proportional(11.0_f32 * self.canvas_zoom),
+                    accent_color,
+                );
+            }
+
             if step.image_path.is_some() {
                 painter.text(
                     Pos2::new(
@@ -1045,9 +1244,8 @@ impl AlgoApp {
             }
 
             let port_in = Pos2::new(rect.center().x, rect.min.y);
-            let port_out = Pos2::new(rect.center().x, rect.max.y);
 
-            // Порт входа (IN)
+            // Порт входа
             if is_selected {
                 let glow_in = if is_dark {
                     Color32::from_rgb(56, 189, 248)
@@ -1077,46 +1275,158 @@ impl AlgoApp {
                 );
             }
 
-            // Порт выхода (OUT)
+            // Порты выхода с адаптивными цветами точек
             if !is_test_mode {
-                let is_port_hovered = pointer.hover_pos().map_or(false, |p| {
-                    p.distance(port_out) <= 12.0_f32 * self.canvas_zoom
-                });
+                match &step.kind {
+                    StepKind::Subprocess {
+                        next_if_success,
+                        next_if_failure,
+                        ..
+                    } => {
+                        let s_tx = next_if_success
+                            .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                            .map(|(_, r)| r.center().x);
+                        let f_tx = next_if_failure
+                            .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                            .map(|(_, r)| r.center().x);
+                        let succ_on_left = match (s_tx, f_tx) {
+                            (Some(sx), Some(fx)) => sx <= fx,
+                            (Some(sx), None) => sx <= rect.center().x,
+                            (None, Some(fx)) => fx > rect.center().x,
+                            (None, None) => true,
+                        };
 
-                if is_selected {
-                    let glow_out = if is_dark {
-                        Color32::from_rgb(255, 205, 50)
-                    } else {
-                        Color32::from_rgb(217, 119, 6)
-                    };
-                    painter.circle_stroke(
-                        port_out,
-                        6.5_f32 * self.canvas_zoom,
-                        Stroke::new(1.5_f32 * self.canvas_zoom, glow_out),
-                    );
-                    painter.circle_filled(port_out, 4.5_f32 * self.canvas_zoom, glow_out);
-                    painter.circle_stroke(
-                        port_out,
-                        4.5_f32 * self.canvas_zoom,
-                        Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
-                    );
-                } else {
-                    let p_color = if is_port_hovered || self.wire_drag_source_id == Some(step.id) {
-                        if is_dark {
-                            Color32::from_rgb(255, 205, 50)
+                        let ok_c = if is_dark {
+                            Color32::from_rgb(60, 210, 130)
                         } else {
-                            Color32::from_rgb(217, 119, 6)
-                        }
-                    } else {
-                        accent_color
-                    };
+                            Color32::from_rgb(16, 185, 129)
+                        };
+                        let fail_c = if is_dark {
+                            Color32::from_rgb(255, 90, 90)
+                        } else {
+                            Color32::from_rgb(220, 38, 38)
+                        };
 
-                    painter.circle_filled(port_out, 4.2_f32 * self.canvas_zoom, p_color);
-                    painter.circle_stroke(
-                        port_out,
-                        4.2_f32 * self.canvas_zoom,
-                        Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
-                    );
+                        let (left_c, right_c) = if succ_on_left {
+                            (ok_c, fail_c)
+                        } else {
+                            (fail_c, ok_c)
+                        };
+                        let left_p =
+                            Pos2::new(rect.min.x + 42.0_f32 * self.canvas_zoom, rect.max.y);
+                        let right_p =
+                            Pos2::new(rect.max.x - 42.0_f32 * self.canvas_zoom, rect.max.y);
+
+                        painter.circle_filled(left_p, 4.2_f32 * self.canvas_zoom, left_c);
+                        painter.circle_stroke(
+                            left_p,
+                            4.2_f32 * self.canvas_zoom,
+                            Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
+                        );
+
+                        painter.circle_filled(right_p, 4.2_f32 * self.canvas_zoom, right_c);
+                        painter.circle_stroke(
+                            right_p,
+                            4.2_f32 * self.canvas_zoom,
+                            Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
+                        );
+                    }
+                    StepKind::Measurement {
+                        next_if_normal,
+                        next_if_abnormal,
+                        ..
+                    } => {
+                        let n_tx = next_if_normal
+                            .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                            .map(|(_, r)| r.center().x);
+                        let a_tx = next_if_abnormal
+                            .and_then(|id| node_rects.iter().find(|(i, _)| *i == id))
+                            .map(|(_, r)| r.center().x);
+                        let norm_on_left = match (n_tx, a_tx) {
+                            (Some(nx), Some(ax)) => nx <= ax,
+                            (Some(nx), None) => nx <= rect.center().x,
+                            (None, Some(ax)) => ax > rect.center().x,
+                            (None, None) => true,
+                        };
+
+                        let norm_c = if is_dark {
+                            Color32::from_rgb(60, 210, 130)
+                        } else {
+                            Color32::from_rgb(16, 185, 129)
+                        };
+                        let abn_c = if is_dark {
+                            Color32::from_rgb(255, 90, 90)
+                        } else {
+                            Color32::from_rgb(220, 38, 38)
+                        };
+
+                        let (left_c, right_c) = if norm_on_left {
+                            (norm_c, abn_c)
+                        } else {
+                            (abn_c, norm_c)
+                        };
+                        let left_p =
+                            Pos2::new(rect.min.x + 42.0_f32 * self.canvas_zoom, rect.max.y);
+                        let right_p =
+                            Pos2::new(rect.max.x - 42.0_f32 * self.canvas_zoom, rect.max.y);
+
+                        painter.circle_filled(left_p, 4.2_f32 * self.canvas_zoom, left_c);
+                        painter.circle_stroke(
+                            left_p,
+                            4.2_f32 * self.canvas_zoom,
+                            Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
+                        );
+
+                        painter.circle_filled(right_p, 4.2_f32 * self.canvas_zoom, right_c);
+                        painter.circle_stroke(
+                            right_p,
+                            4.2_f32 * self.canvas_zoom,
+                            Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
+                        );
+                    }
+                    _ => {
+                        let port_out = Pos2::new(rect.center().x, rect.max.y);
+                        let is_port_hovered = pointer.hover_pos().map_or(false, |p| {
+                            p.distance(port_out) <= 14.0_f32 * self.canvas_zoom
+                        });
+
+                        if is_selected {
+                            let glow_out = if is_dark {
+                                Color32::from_rgb(255, 205, 50)
+                            } else {
+                                Color32::from_rgb(217, 119, 6)
+                            };
+                            painter.circle_stroke(
+                                port_out,
+                                6.5_f32 * self.canvas_zoom,
+                                Stroke::new(1.5_f32 * self.canvas_zoom, glow_out),
+                            );
+                            painter.circle_filled(port_out, 4.5_f32 * self.canvas_zoom, glow_out);
+                            painter.circle_stroke(
+                                port_out,
+                                4.5_f32 * self.canvas_zoom,
+                                Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
+                            );
+                        } else {
+                            let p_color =
+                                if is_port_hovered || self.wire_drag_source_id == Some(step.id) {
+                                    if is_dark {
+                                        Color32::from_rgb(255, 205, 50)
+                                    } else {
+                                        Color32::from_rgb(217, 119, 6)
+                                    }
+                                } else {
+                                    accent_color
+                                };
+
+                            painter.circle_filled(port_out, 4.2_f32 * self.canvas_zoom, p_color);
+                            painter.circle_stroke(
+                                port_out,
+                                4.2_f32 * self.canvas_zoom,
+                                Stroke::new(1.2_f32 * self.canvas_zoom, Color32::WHITE),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1144,7 +1454,7 @@ impl AlgoApp {
             );
         }
 
-        // Интерактивная миникарта
+        // Миникарта
         if !self.active_algo.steps.is_empty() {
             let toggle_size = Vec2::splat(18.0_f32);
             let toggle_rect = Rect::from_min_size(
@@ -1254,6 +1564,18 @@ impl AlgoApp {
                         StepKind::SafetyWarning { next_step_id, .. } => {
                             if let Some(nid) = next_step_id {
                                 target_ids.push(*nid);
+                            }
+                        }
+                        StepKind::Subprocess {
+                            next_if_success,
+                            next_if_failure,
+                            ..
+                        } => {
+                            if let Some(sid) = next_if_success {
+                                target_ids.push(*sid);
+                            }
+                            if let Some(fid) = next_if_failure {
+                                target_ids.push(*fid);
                             }
                         }
                     }
@@ -1472,7 +1794,7 @@ impl AlgoApp {
             }
         }
 
-        // Поиск по узлам (Ctrl+F)
+        // Поиск Ctrl+F
         if self.show_search_bar && !is_test_mode {
             let search_area_pos =
                 Pos2::new(canvas_rect.max.x - 310.0_f32, canvas_rect.min.y + 12.0_f32);
@@ -1559,7 +1881,7 @@ impl AlgoApp {
             }
         }
 
-        // Контекстное меню ПКМ (только в Конструкторе)
+        // Контекстное меню ПКМ
         if let Some(menu) = self.context_menu {
             let mut close_menu = false;
             let mut action_duplicate = false;

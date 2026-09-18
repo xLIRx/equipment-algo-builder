@@ -23,7 +23,8 @@ impl AlgoApp {
                     ui.add_space(6.0_f32);
                     ui.horizontal(|ui| {
                         if ui.button(lang.btn_save_and_exit()).clicked() {
-                            if save_algorithm_to_archive(&mut self.active_algo).is_ok() {
+                            let mut root = self.sync_root_algorithm();
+                            if save_algorithm_to_archive(&mut root).is_ok() {
                                 self.force_close = true;
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }

@@ -12,12 +12,29 @@ use uuid::Uuid;
 
 const MAX_UNDO_DEPTH: usize = 40;
 
+#[derive(Clone)]
+pub struct SubprocessNavFrame {
+    pub parent_step_id: Uuid,
+    pub parent_algo: Algorithm,
+    pub parent_title: String,
+}
+
+#[derive(Clone)]
+pub struct RunnerCallFrame {
+    pub parent_step_id: Uuid,
+    pub parent_algo: Algorithm,
+    pub parent_history: Vec<Uuid>,
+    pub had_abnormality: bool,
+}
+
 #[derive(Default)]
 pub struct RunnerState {
     pub current_step_id: Option<Uuid>,
     pub history: Vec<Uuid>,
     pub measurement_input: String,
     pub safety_acknowledged: bool,
+    pub call_stack: Vec<RunnerCallFrame>,
+    pub had_abnormality: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +48,7 @@ pub struct AlgoApp {
     pub settings: AppSettings,
     pub active_algo: Algorithm,
     pub last_saved_algo: Option<Algorithm>,
+    pub subprocess_stack: Vec<SubprocessNavFrame>,
 
     pub undo_stack: Vec<Algorithm>,
     pub redo_stack: Vec<Algorithm>,
@@ -118,7 +136,195 @@ impl AlgoApp {
             archive_selected_mfg: None,
             archive_selected_model: None,
             confirm_delete_target: None,
+            subprocess_stack: Vec::new(),
         }
+    }
+
+    /// Погружение внутрь подпроцесса (Drill-down)
+    pub fn enter_subprocess(&mut self, step_id: Uuid) {
+        let parent_title = self
+            .active_algo
+            .steps
+            .iter()
+            .find(|s| s.id == step_id)
+            .map(|s| s.title.clone())
+            .unwrap_or_default();
+
+        let child_algo =
+            if let Some(step) = self.active_algo.steps.iter_mut().find(|s| s.id == step_id) {
+                if let StepKind::Subprocess { sub_algo, .. } = &mut step.kind {
+                    Some(std::mem::take(sub_algo))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some(child) = child_algo {
+            self.subprocess_stack.push(SubprocessNavFrame {
+                parent_step_id: step_id,
+                parent_algo: self.active_algo.clone(),
+                parent_title,
+            });
+            self.active_algo = *child;
+            self.selected_step_ids.clear();
+            self.canvas_pan = Vec2::new(120.0_f32, 100.0_f32);
+            self.target_pan = None;
+            self.canvas_zoom = 1.0_f32;
+        }
+    }
+
+    pub fn delete_selected(&mut self) {
+        if self.selected_step_ids.is_empty() {
+            return;
+        }
+        self.snapshot_for_undo();
+
+        let to_delete = self.selected_step_ids.clone();
+        self.active_algo
+            .steps
+            .retain(|s| !to_delete.contains(&s.id));
+
+        for s in &mut self.active_algo.steps {
+            for opt in &mut s.options {
+                if opt.next_step_id.map_or(false, |id| to_delete.contains(&id)) {
+                    opt.next_step_id = None;
+                }
+            }
+            match &mut s.kind {
+                StepKind::Measurement {
+                    next_if_normal,
+                    next_if_abnormal,
+                    ..
+                } => {
+                    if next_if_normal.map_or(false, |id| to_delete.contains(&id)) {
+                        *next_if_normal = None;
+                    }
+                    if next_if_abnormal.map_or(false, |id| to_delete.contains(&id)) {
+                        *next_if_abnormal = None;
+                    }
+                }
+                StepKind::SafetyWarning { next_step_id, .. } => {
+                    if next_step_id.map_or(false, |id| to_delete.contains(&id)) {
+                        *next_step_id = None;
+                    }
+                }
+                StepKind::Subprocess {
+                    next_if_success,
+                    next_if_failure,
+                    ..
+                } => {
+                    if next_if_success.map_or(false, |id| to_delete.contains(&id)) {
+                        *next_if_success = None;
+                    }
+                    if next_if_failure.map_or(false, |id| to_delete.contains(&id)) {
+                        *next_if_failure = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if self
+            .active_algo
+            .first_step_id
+            .map_or(false, |id| to_delete.contains(&id))
+        {
+            self.active_algo.first_step_id = self.active_algo.steps.first().map(|s| s.id);
+        }
+
+        self.selected_step_ids.clear();
+    }
+
+    pub fn connect_nodes(&mut self, from_id: Uuid, to_id: Uuid) {
+        if from_id == to_id {
+            return;
+        }
+        self.snapshot_for_undo();
+        let lang = self.settings.language;
+        if let Some(source) = self.active_algo.steps.iter_mut().find(|s| s.id == from_id) {
+            match &mut source.kind {
+                StepKind::Standard => {
+                    if let Some(opt) = source.options.iter_mut().find(|o| o.next_step_id.is_none())
+                    {
+                        opt.next_step_id = Some(to_id);
+                    } else {
+                        let opt_text = lang.default_option_link_text(source.options.len() + 1);
+                        source.options.push(crate::models::OptionLink {
+                            text: opt_text,
+                            next_step_id: Some(to_id),
+                        });
+                    }
+                }
+                StepKind::Measurement {
+                    next_if_normal,
+                    next_if_abnormal,
+                    ..
+                } => {
+                    if next_if_normal.is_none() {
+                        *next_if_normal = Some(to_id);
+                    } else if next_if_abnormal.is_none() {
+                        *next_if_abnormal = Some(to_id);
+                    } else {
+                        *next_if_normal = Some(to_id);
+                    }
+                }
+                StepKind::SafetyWarning { next_step_id, .. } => {
+                    *next_step_id = Some(to_id);
+                }
+                StepKind::Subprocess {
+                    next_if_success,
+                    next_if_failure,
+                    ..
+                } => {
+                    if next_if_success.is_none() {
+                        *next_if_success = Some(to_id);
+                    } else {
+                        *next_if_failure = Some(to_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Возврат на уровень выше к родительской схеме
+    pub fn leave_subprocess(&mut self) {
+        if let Some(frame) = self.subprocess_stack.pop() {
+            let child_algo = std::mem::take(&mut self.active_algo);
+            let mut parent_algo = frame.parent_algo;
+            if let Some(step) = parent_algo
+                .steps
+                .iter_mut()
+                .find(|s| s.id == frame.parent_step_id)
+            {
+                if let StepKind::Subprocess { sub_algo, .. } = &mut step.kind {
+                    *sub_algo = Box::new(child_algo);
+                }
+            }
+            self.active_algo = parent_algo;
+            self.selected_step_ids.clear();
+            self.selected_step_ids.insert(frame.parent_step_id);
+        }
+    }
+
+    /// Синхронизирует изменения текущего подуровня вверх до корня для сохранения
+    pub fn sync_root_algorithm(&self) -> Algorithm {
+        let mut root = self.active_algo.clone();
+        for frame in self.subprocess_stack.iter().rev() {
+            let mut parent = frame.parent_algo.clone();
+            if let Some(step) = parent
+                .steps
+                .iter_mut()
+                .find(|s| s.id == frame.parent_step_id)
+            {
+                if let StepKind::Subprocess { sub_algo, .. } = &mut step.kind {
+                    *sub_algo = Box::new(root);
+                }
+            }
+            root = parent;
+        }
+        root
     }
 
     pub fn zoom_by_step(&mut self, zoom_in: bool, focal_point: Vec2) {
@@ -211,7 +417,8 @@ impl AlgoApp {
     }
 
     pub fn has_unsaved_changes(&self) -> bool {
-        self.last_saved_algo.as_ref() != Some(&self.active_algo)
+        let current_root = self.sync_root_algorithm();
+        self.last_saved_algo.as_ref() != Some(&current_root)
     }
 
     pub fn set_status(&mut self, text: String) {
@@ -297,96 +504,6 @@ impl AlgoApp {
         self.selected_step_ids = new_selection;
     }
 
-    pub fn delete_selected(&mut self) {
-        if self.selected_step_ids.is_empty() {
-            return;
-        }
-        self.snapshot_for_undo();
-
-        let to_delete = self.selected_step_ids.clone();
-        self.active_algo
-            .steps
-            .retain(|s| !to_delete.contains(&s.id));
-
-        for s in &mut self.active_algo.steps {
-            for opt in &mut s.options {
-                if opt.next_step_id.map_or(false, |id| to_delete.contains(&id)) {
-                    opt.next_step_id = None;
-                }
-            }
-            match &mut s.kind {
-                StepKind::Measurement {
-                    next_if_normal,
-                    next_if_abnormal,
-                    ..
-                } => {
-                    if next_if_normal.map_or(false, |id| to_delete.contains(&id)) {
-                        *next_if_normal = None;
-                    }
-                    if next_if_abnormal.map_or(false, |id| to_delete.contains(&id)) {
-                        *next_if_abnormal = None;
-                    }
-                }
-                StepKind::SafetyWarning { next_step_id, .. } => {
-                    if next_step_id.map_or(false, |id| to_delete.contains(&id)) {
-                        *next_step_id = None;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if self
-            .active_algo
-            .first_step_id
-            .map_or(false, |id| to_delete.contains(&id))
-        {
-            self.active_algo.first_step_id = self.active_algo.steps.first().map(|s| s.id);
-        }
-
-        self.selected_step_ids.clear();
-    }
-
-    pub fn connect_nodes(&mut self, from_id: Uuid, to_id: Uuid) {
-        if from_id == to_id {
-            return;
-        }
-        self.snapshot_for_undo();
-        let lang = self.settings.language;
-        if let Some(source) = self.active_algo.steps.iter_mut().find(|s| s.id == from_id) {
-            match &mut source.kind {
-                StepKind::Standard => {
-                    if let Some(opt) = source.options.iter_mut().find(|o| o.next_step_id.is_none())
-                    {
-                        opt.next_step_id = Some(to_id);
-                    } else {
-                        let opt_text = lang.default_option_link_text(source.options.len() + 1);
-                        source.options.push(crate::models::OptionLink {
-                            text: opt_text,
-                            next_step_id: Some(to_id),
-                        });
-                    }
-                }
-                StepKind::Measurement {
-                    next_if_normal,
-                    next_if_abnormal,
-                    ..
-                } => {
-                    if next_if_normal.is_none() {
-                        *next_if_normal = Some(to_id);
-                    } else if next_if_abnormal.is_none() {
-                        *next_if_abnormal = Some(to_id);
-                    } else {
-                        *next_if_normal = Some(to_id);
-                    }
-                }
-                StepKind::SafetyWarning { next_step_id, .. } => {
-                    *next_step_id = Some(to_id);
-                }
-            }
-        }
-    }
-
     pub fn render_builder_mode(&mut self, ui: &mut egui::Ui) {
         let view_size = ui.available_size_before_wrap();
         let lang = self.settings.language;
@@ -431,8 +548,9 @@ impl AlgoApp {
                 };
 
                 if ui.button(save_btn_text).clicked() {
-                    if save_algorithm_to_archive(&mut self.active_algo).is_ok() {
-                        self.last_saved_algo = Some(self.active_algo.clone());
+                    let mut root = self.sync_root_algorithm();
+                    if save_algorithm_to_archive(&mut root).is_ok() {
+                        self.last_saved_algo = Some(root);
                         self.set_status(lang.save_success().to_string());
                         self.refresh_archive();
                     }
@@ -469,10 +587,11 @@ impl AlgoApp {
                 }
 
                 if ui.button(lang.btn_export_json()).clicked() {
+                    let root = self.sync_root_algorithm();
                     let default_fname = format!(
                         "{}_{}.json",
-                        self.active_algo.metadata.manufacturer.trim(),
-                        self.active_algo.metadata.name.trim()
+                        root.metadata.manufacturer.trim(),
+                        root.metadata.name.trim()
                     )
                     .replace(' ', "_");
 
@@ -481,7 +600,7 @@ impl AlgoApp {
                         .set_file_name(&default_fname)
                         .save_file()
                     {
-                        if export_algorithm_to_file(&self.active_algo, &path).is_ok() {
+                        if export_algorithm_to_file(&root, &path).is_ok() {
                             self.set_status(lang.export_json_success().to_string());
                         }
                     }
@@ -675,6 +794,16 @@ impl AlgoApp {
                     }
                 }
 
+                // Кнопка авто-расстановки
+                if ui
+                    .button(lang.btn_auto_layout())
+                    .on_hover_text(lang.auto_layout_tip())
+                    .clicked()
+                {
+                    self.apply_auto_layout();
+                    self.fit_to_view(view_size);
+                }
+
                 if wire_resp
                     .on_hover_text(lang.wire_style_toggle_tip())
                     .clicked()
@@ -720,6 +849,34 @@ impl AlgoApp {
             }
         });
         ui.separator();
+
+        // Хлебные крошки подпроцессов (если находимся внутри композитного блока)
+        if !self.subprocess_stack.is_empty() {
+            ui.horizontal(|ui| {
+                let back_btn = egui::Button::new(
+                    egui::RichText::new(lang.btn_return_to_parent())
+                        .color(Color32::WHITE)
+                        .strong(),
+                )
+                .fill(Color32::from_rgb(147, 51, 234))
+                .rounding(4.0_f32);
+
+                if ui.add(back_btn).clicked() {
+                    self.leave_subprocess();
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(lang.crumb_root()).color(Color32::from_rgb(140, 150, 168)),
+                );
+
+                for frame in &self.subprocess_stack {
+                    ui.label("➔");
+                    ui.label(egui::RichText::new(&frame.parent_title).strong());
+                }
+            });
+            ui.add_space(2.0_f32);
+        }
 
         let wants_kb = ui.ctx().wants_keyboard_input();
         if !wants_kb && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
